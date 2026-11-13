@@ -211,7 +211,47 @@ def gdrive_public_download(file_id, dest_path):
 # ==========================================
 LAST_GOOD_ROUTE = {"method": None}  # remembered between jobs for speed
 
-def fetch_pdf(site, file_id, url):
+def friday_resolve(site, subject, category, year, paper):
+    """Ask the site to turn (subject, level, year, paper) into a Drive file id.
+    The site checks its library first, then searches its own Drive — covers
+    chop requests that arrived without any file id at all."""
+    try:
+        s = dock_session()
+        r = s.post(f"{site}/friday_fetch.php?command=resolve",
+                   json={"secret": CONFIG["site_secret"], "subject": subject or "",
+                         "category": category or "", "year": str(year or ""),
+                         "paper": int(paper or 0)}, timeout=90)
+        j = r.json()
+        if j.get("ok") and j.get("file_id"):
+            log(f"   [FETCH] site resolved the paper → {str(j['file_id'])[:12]}… ({j.get('how', '?')})")
+            return j["file_id"]
+        log(f"   [FETCH] site could not resolve: {j.get('msg', 'no match')}")
+    except Exception as e:
+        log(f"   [FETCH] resolve failed: {str(e)[:120]}")
+    return None
+
+def friday_fetch_proxy(site, file_id, dest):
+    """Route 0 — stream the PDF through the site's signed-in Drive proxy.
+    Works even when the Drive file is fully private (the site signs in,
+    Friday stays signed out)."""
+    try:
+        s = dock_session()
+        r = s.post(f"{site}/friday_fetch.php?command=fetch",
+                   json={"secret": CONFIG["site_secret"], "file_id": file_id}, timeout=300)
+        if r.status_code == 200 and looks_like_pdf(r.content):
+            with open(dest, "wb") as f:
+                f.write(r.content)
+            if os.path.getsize(dest) > MIN_PDF_BYTES:
+                log(f"   [FETCH] downloaded via site proxy ({os.path.getsize(dest)} bytes)")
+                return True
+            log("   [FETCH] site proxy gave a suspiciously small file — rejected")
+        else:
+            log(f"   [FETCH] site proxy: HTTP {r.status_code}, not a usable PDF")
+    except Exception as e:
+        log(f"   [FETCH] site proxy failed: {str(e)[:120]}")
+    return False
+
+def fetch_pdf(site, file_id, url, meta=None):
     """Get the paper PDF by any means necessary. Returns local path or None."""
     dest = os.path.join(BASE_DIR, "temp_queue.pdf")
 
@@ -221,6 +261,18 @@ def fetch_pdf(site, file_id, url):
         if extracted:
             log(f"   [QUEUE] extracted Drive ID from URL → {extracted[:12]}…")
             file_id = extracted
+
+    # ── Route 0 — the site's own side door (works for PRIVATE Drive files) ──
+    # resolve the paper to a Drive id when the request arrived without one
+    fid = file_id
+    if not fid and meta:
+        subject, category, year, paper = meta
+        fid = friday_resolve(site, subject, category, year, paper)
+    if fid:
+        if friday_fetch_proxy(site, fid, dest):
+            LAST_GOOD_ROUTE["method"] = "siteproxy"
+            STATS["last_route"] = "site proxy"
+            return dest
 
     # reorder routes if the last job found a winner
     if LAST_GOOD_ROUTE["method"] == "drive":
@@ -507,7 +559,7 @@ def process_chop_queue(max_jobs=99):
         report(10, "working")
 
         # ── get the PDF (smart multi-route, no OAuth) ──
-        pdf_path = fetch_pdf(site, file_id, url)
+        pdf_path = fetch_pdf(site, file_id, url, meta=(subject, category, year, paper))
 
         if not pdf_path:
             log("   [QUEUE] could not obtain PDF — marking error")
@@ -596,7 +648,7 @@ def worker_loop():
 
 def run_once(max_jobs=None):
     """GitHub Actions mode: wake up, chop what is waiting, exit."""
-    log("⚔️ Friday GitHub Edition v2.0 — --once (CI wake-up)")
+    log("⚔️ Friday GitHub Edition v2.1 — --once (CI wake-up)")
     if max_jobs is None: max_jobs = MAX_JOBS_PER_RUN
     missing = [k for k in ("groq_api_key","site_url","site_secret") if not CONFIG.get(k)]
     if missing:
