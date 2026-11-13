@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+temp_queue.pdf
+temp_page_*.png
+.env
+friday_system/
